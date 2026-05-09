@@ -9,3 +9,7 @@ The orchestration flow included Lookup activities, Set Variables, Copy Activitie
 One practical challenge was that ADF generated empty files when no new records were available. To solve this, we implemented conditional file cleanup logic using If Condition and Delete activities, ensuring that unnecessary empty files were automatically removed before downstream processing.
 
 Overall, this architecture helped us create a scalable, reusable, and optimized ingestion framework with reliable CDC handling, dynamic execution capability, and efficient Bronze layer storage management for downstream Databricks Medallion processing.”
+
+
+
+Our implementation used Azure SQL as a relational staging layer between the API and Bronze storage because it simplified parsing, CDC handling, and watermark-based incremental loading. However, another industry-standard approach is directly landing raw API payloads into ADLS Bronze storage first and then processing them downstream using Databricks or ADF transformations. Both architectures are valid depending on scalability, governance, replayability, and business requirements
