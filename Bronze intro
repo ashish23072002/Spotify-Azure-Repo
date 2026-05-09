@@ -1,0 +1,11 @@
+where I worked primarily on building a scalable and metadata-driven ingestion framework using Azure Data Factory and Azure SQL Server.
+
+The source system exposed pharmaceutical and clinical data through REST APIs in nested JSON format. To handle this efficiently, we designed a two-stage ingestion architecture. In the first stage, Azure Data Factory connected to the APIs using REST Linked Services and Azure Integration Runtime, then extracted the JSON payloads and loaded them into an Azure SQL relational staging layer. This staging layer converted semi-structured API responses into normalized rows and columns, making downstream processing more reliable and easier to manage.
+
+In the second stage, we built a metadata-driven pipeline in ADF for Bronze layer ingestion into ADLS Gen2. The pipeline was fully parameterized using dynamic content, allowing the same framework to process multiple tables and feeds without hardcoding logic. We implemented incremental loading using watermarking and CDC (Change Data Capture) techniques, where the pipeline dynamically fetched the latest processed timestamp from a control table and extracted only newly updated records.
+
+The orchestration flow included Lookup activities, Set Variables, Copy Activities, If Conditions, and dynamic sink partitioning based on ingestion date and source system. We also designed the pipeline with idempotent pipeline principles to avoid duplicate processing during reruns.
+
+One practical challenge was that ADF generated empty files when no new records were available. To solve this, we implemented conditional file cleanup logic using If Condition and Delete activities, ensuring that unnecessary empty files were automatically removed before downstream processing.
+
+Overall, this architecture helped us create a scalable, reusable, and optimized ingestion framework with reliable CDC handling, dynamic execution capability, and efficient Bronze layer storage management for downstream Databricks Medallion processing.”
