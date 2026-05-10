@@ -1,0 +1,299 @@
+# Modernizing Drugs Data Pipelines on Azure: ADF + Databricks Medallion Architecture
+
+This master guide outlines the cloud modernization of the **Global Drugs Data Ingestion and Analytical Pipeline** from legacy internal tools to **Azure Data Factory (ADF)**, **Azure Databricks (Apache Spark)**, and **Delta Lake** (Medallion Architecture). 
+
+Use this document as your comprehensive reference guide for technical interviews. It translates your concrete engineering accomplishments in the Drugs Data project (handling Medical Note Inc. feeds, Phase 1/2 expansions, ontology predicates, alcohol interactions, duplications, and reconciliation bugs) into a modern, enterprise-grade Azure Cloud architecture.
+
+---
+
+## Table of Contents
+1. [End-to-End Azure Data Pipeline Architecture](#1-end-to-end-azure-data-pipeline-architecture)
+2. [Internal Google Tools vs. Azure Cloud Mapping](#2-internal-google-tools-vs-azure-cloud-mapping)
+3. [Medallion Architecture In-Depth (Bronze $\rightarrow$ Silver $\rightarrow$ Gold)](#3-medallion-architecture-in-depth)
+4. [Handling Core Drug Pipeline Validation Logic](#4-handling-core-drug-pipeline-validation-logic)
+5. [STAR Interview Scenario: Overcoming a Challenging Spark Scale Challenge](#5-star-interview-scenario)
+6. [Technical Interview Q&A: Azure Databricks & ADF Deep Dive](#6-technical-interview-qa)
+
+---
+
+## 1. End-to-End Azure Data Pipeline Architecture
+
+The diagram below outlines how clinical and commercial drug feed data is ingested, cleaned, enriched, and published on Azure:
+
+```mermaid
+graph TD
+    %% Ingestion Sources
+    A[Client Weekly CSV Uploads] -->|Event Grid Triggers| B(Azure Data Factory)
+    A2[Control Table / CDC Watermarks] -->|Metadata-Driven Copy| B
+    
+    %% Azure Data Factory Orchestration
+    B -->|1. Parquet Conversion & Validation| C[(ADLS Gen2: Bronze Directory)]
+    
+    %% Databricks Medallion Layers
+    C -->|2. Auto-Loader & badRecordsPath| D([Databricks Bronze Table])
+    D -->|3. Explode / Cleanse / Flatten| E([Databricks Silver Delta Table])
+    
+    %% Gold Lake & Analysis
+    E -->|4. De-duplication & Broadcast Ontology Joins| F([Databricks Gold Delta Tables])
+    F -->|Clinically Valid Catalog| G[PowerBI / Reporting Dashboards]
+    F -->|Consumable Clinical API| H[Azure Cognitive Search / Synapse]
+```
+
+### Ingestion Flow:
+1. **Extraction & Orchestration (Azure Data Factory)**: The client uploads weekly CSV files directly into a landing container in **Azure Data Lake Storage Gen2**. We architected an event-driven pattern using **Azure Event Grid** coupled with **ADF Event Triggers** to automatically execute the ingestion pipeline upon file arrival.
+2. **Metadata-Driven Bronze & Incremental CDC**: Instead of hardcoded logic, the pipeline uses dynamic parameterized control flows (Lookup, Set Variables, If Conditions) to orchestrate multiple tables and feeds. By fetching the latest high-watermark timestamp from a control table, we filter and ingest purely modified or new files/records for downstream Silver processing. Additionally, the ADF orchestration writes the raw CSVs into the Bronze layer in optimized **Parquet** format partitioned by ingestion date and source system.
+3. **Idempotence & Empty File Cleanup**: To guarantee idempotency during automated reruns, and prevent downstream processing overhead from blank input feeds, we integrated a conditional file cleanup mechanism using **If Condition** and **Delete activities** to purge unnecessary empty files before downstream Medallion transforms.
+4. **Spark Processing via Databricks**: ADF invokes Databricks notebooks running on **Auto-Scaling Multi-Node Clusters** to trigger the subsequent Silver and Gold transformations.
+
+---
+
+## 2. Internal Google Tools vs. Azure Cloud Mapping
+
+To effectively explain your project to external cloud interviewers, map your internal, proprietary tools to their industry-standard Azure equivalents:
+
+| Internal Google Concept | Azure Equivalent Product / Concept | Role in Pipeline / Function |
+| :--- | :--- | :--- |
+| **CNS (Clustered File System)** | **Azure Data Lake Storage (ADLS) Gen2** | Scalable, security-rich blob storage configured with hierarchical namespaces for Bronze/Silver/Gold directory structures. |
+| **KETL Ingestion Pipelines** | **Azure Data Factory (ADF) Pipelines** | Orchestrator for moving files from partners, setting up triggers, loading raw feeds, and launching downstream Spark nodes. |
+| **Xenon Storage Datasets** | **Bronze Storage Layer (Raw Folder)** | Immutable, exact representations of source JSON arrays (e.g., `Medicine_Info_Feed.json`, `googleFeedCombination.json`). |
+| **Plx / Plx SQL Scripts** | **Databricks Python & SQL Notebooks** | Ad-hoc querying, data exploration, product duplicacy detection scripts, and reporting pipelines. |
+| **Piper Controlled Workflows** | **ADF Trigger & Azure DevOps Pipelines** | Automated scheduling, CI/CD deployment of code modifications, and pipeline maintenance. |
+| **Accord ID / contract (n99037)** | **Partner Schema / SLA Metadata Repository** | Schema contracts enforcing specific mapping logic between the partner schema (MedicalNote Inc API) and clinical consumer schemas. |
+| **{vf-ontology-triage}** | **Delta Lake Metadata Ontology Tables** | Clinical lookups storing predicates, classifications, and standard mapping terms. |
+
+---
+
+## 3. Medallion Architecture In-Depth
+
+To process drugs data scale requirements securely, we implement the **Medallion Architecture** within Azure Databricks using **Delta Lake**:
+
+```markdown
+   RAW NESTED FEEDS                        FLATTENED & VALIDATED                    BUSINESS ENRICHED DATASPACE
+  ┌────────────────┐                      ┌─────────────────────┐                  ┌───────────────────────────┐
+  │  BRONZE LAYER  │ ───[PySpark Explode]──>│    SILVER LAYER     │ ──[Ontology Join]──>│        GOLD LAYER         │
+  │  Raw JSONs     │                      │  Flattened Delta    │                  │   Clean Drug Catalog      │
+  └────────────────┘                      └─────────────────────┘                  └───────────────────────────┘
+```
+
+### A. Bronze Layer (Raw Ingestion)
+* **Objective**: Retain original, unparsed, nested JSON structures from raw files as a point of truth.
+* **Implementation**: 
+  * Set up **Databricks Auto-Loader** (`cloudFiles`) to scan `/mnt/bronze/` for incoming JSON feeds incremental updates.
+  * Stores data as file-based tables directly in Delta Format using binary formats or raw structures, preserving any anomalous records (e.g., files with incorrect character encodings like `ISO-8859-1` or unescaped double quotes).
+
+### B. Silver Layer (Clean & Enforce Schema)
+* **Objective**: Enforce consistent structures, clean character sets, validate critical parameters, and flatten high-depth nested arrays.
+* **Implementation**:
+  * Parse nested arrays using PySpark's `explode()` function to extract `GenericDrug`, `Brand`, and `Product` nodes into individual flat rows.
+  * Standardize data formats (e.g., encoding normalizations to handle mixed `Windows-1252` or `ISO-8859-1` strings).
+  * Execute semantic validations. Example: Flagging missing or Null `DrugAlcoholInteractions` based on safety rules.
+  * Save cleaned outputs in partitioned **Silver Delta Tables** (`/mnt/silver/drugs_catalog`).
+
+### C. Gold Layer (Business-Ready Aggregates)
+* **Objective**: Combine validated clinical datasets into a high-performance **Star Schema** to feed downstream analytics/consumers.
+* **Implementation**:
+  * Resolve **Product Duplicacy** by running multi-key window analytical operations over `ProductName` and `dosageFormId`.
+  * Build optimized columns and indexing with **Z-Ordering** on active clinical identifiers (e.g. `dosageFormId`, `GenericDrugId`) to maximize PowerBI Dashboard query speeds and APIs retrieval.
+
+---
+
+### D. Star Schema Pattern & Justification (Gold Layer)
+
+To optimize the curated data for self-service analytics and PowerBI reporting, we transformed the flattened Silver tables into a **Star Schema** model. Based on the target drug feed attributes, this includes:
+
+#### 1. Central Fact & Associated Dimensions
+* **`fact_drug_metrics`**: Holds measurable metrics, event aggregations, and primary clinical keys (e.g., `GenericDrugId`, `DrugAvailability`, reporting frequencies, ingestion timestamps, and any computed interaction/incident flags).
+* **`dim_drug_class`**: Stores primary classification details (`GenericDrugId`, `CommonName`, `BrandName`, `ProductName`, `DrugTherapeuticClass`, `DrugDescription`, `DrugRoute`, `DrugForm`, `DrugDosage`).
+* **`dim_safety_warnings`**: Organizes physiological clinical rules (`GenericDrugId`, `Indications`, `Contraindications`, `PregnancyWarnings`, `LactationWarnings`, `DrivingWarnings`, `KidneyWarnings`, `LiverWarnings`, `DrugMedicationGuidelines`).
+* **`dim_drug_interactions`**: Focuses on reactive contraindication scopes (`GenericDrugId`, `DrugDrugInteractions`, `DrugFoodInteractions`, `DrugAlcoholInteractions`, `DrugTobaccoInteractions`).
+* **`dim_side_effects_allergies`**: Records clinical risks and updates (`GenericDrugId`, `SideEffectFrequency`, `SideEffectWhenToSeeADoctor`, `SideEffectDescription`, `Allergies`, `RecalledDrugUpdates`).
+
+#### 2. Why Star Schema Over Complex Ontology Networks?
+While clinical systems commonly leverage highly normalized **Ontology mappings** (using semantic predicates and relational edges to traverse categories), we explicitly prioritized a **Star Schema** for the Gold Layer because:
+1. **Maximized Analytical Speed & Reduced Shuffles**: Ontology mappings require significant multi-hop recursive joins. The Star Schema denormalizes the data into direct `1:N` central paths, allowing Spark to utilize efficient Broadcast Joins and PowerBI to execute self-service queries without complex query parsing or massive data shuffles.
+2. **Optimized BI Integration**: PowerBI and downstream tabular cubes are natively designed for Star Schemas. Filters applied on dimensions (e.g., isolating specific therapeutic classes or FDA warning statuses) propagate instantly to the fact without writing complex DAX queries or recursive graph traversals.
+3. **Storage & Delta Optimizations**: Separating dense text fields (like descriptions and interaction warnings) into independent dimensions keeps the central Fact table narrow and memory-efficient. This maximizes the performance of Delta Lake's Z-ordering indexing and partition pruning.
+
+---
+
+## 4. Handling Core Drug Pipeline Validation Logic
+
+Here is how the key engineering components you built in the drug pipelines map directly onto standard Python and PySpark routines in Azure Databricks.
+
+### 1. Nested JSON Array Exploding (GenericDrug $\rightarrow$ Brand $\rightarrow$ Product)
+Raw medicine data represents nested hierarchical structures which cannot be directly loaded into typical relational databases. 
+* *Transformation logic:* We read the raw JSON format and explode the structural hierarchy to extract information on individual products:
+
+```python
+from pyspark.sql import functions as F
+
+# Explode GenericDrug, Brand, and nested Product arrays to relational tables
+df_bronze = spark.read.format("delta").load("/mnt/bronze/drugs-data")
+
+df_exploded = df_bronze.select(
+    F.col("GenericDrugId"),
+    F.explode("GenericDrug").alias("drug")
+).select(
+    F.col("GenericDrugId"),
+    F.col("drug.GenericDrugId").alias("drug_id"),
+    F.explode("drug.Brand").alias("brand")
+).select(
+    F.col("drug_id"),
+    F.col("brand.BrandName").alias("brand_name"),
+    F.explode("brand.Product").alias("product")
+).select(
+    F.col("drug_id"),
+    F.col("brand_name"),
+    F.col("product.ProductName").alias("product_name"),
+    F.col("product.DrugAvailability").alias("availability"),
+    F.col("product.DrugAlcoholInteractions").alias("alcohol_interaction")
+)
+```
+
+### 2. Resolving Out-of-Specification Drug-Alcohol Interactions
+Clinical safety depends on checking empty or null interactions. If a premium drug is marked without interactions, it must be isolated.
+* *PySpark Validation Code:*
+```python
+# Validate DrugAlcoholInteractions is populated
+df_validated = df_exploded.withColumn(
+    "is_interaction_flagged",
+    F.when((F.col("alcohol_interaction").isNull()) | (F.trim(F.col("alcohol_interaction")) == ""), True)
+     .otherwise(False)
+)
+
+# Quarantine invalid records
+df_quarantine = df_validated.filter(F.col("is_interaction_flagged") == True)
+df_silver_clean = df_validated.filter(F.col("is_interaction_flagged") == False)
+```
+
+### 3. Resolving Product Duplicacy at Scale
+Duplicate drug names (like duplicate `ProductName` within brand hierarchies or repeated `dosageFormId` records in raw `googleFeedSingle.json`/`googleFeedCombination.json`) skew catalog aggregations and cause onboarding recon failures.
+* *Deduplication Algorithm using Spark Windows:*
+```python
+from pyspark.sql.window import Window
+
+# Define a window partitioned by critical logical keys to retain the latest ingestion
+windowSpec = Window.partitionBy("product_name", "drug_id").orderBy(F.col("ingestion_time").desc())
+
+df_deduplificated = df_silver_clean.withColumn("row_num", F.row_number().over(windowSpec)) \
+                                   .filter(F.col("row_num") == 1) \
+                                   .drop("row_num")
+```
+
+---
+
+## 5. STAR Interview Scenario
+
+Use this structured **STAR** (Situation, Task, Action, Result) format during your Azure Databricks/Spark interview to showcase your technical prowess and ability to design scalable solutions.
+
+### 💬 Question: "Describe a challenging Spark project you worked on and how you solved it."
+
+#### 🌟 Situation (S)
+“In my previous project processing global pharmaceutical drug metadata feeds (such as medicine structures from medical partners like **MedicalNote Inc.** and combined clinical feeds spanning millions of records daily), we faced critical system stability and performance bottlenecks. The raw files arrived in highly nested hierarchical formats (`GenericDrug` $\rightarrow$ `Brand` $\rightarrow$ `Product` structures) with inconsistent text encodings (such as `ISO-8859-1` mixed with dynamic standard character sets), which repeatedly broke our ingestion schedules, caused Out-of-Memory (OOM) failures, and delayed daily reporting dashboards.”
+
+#### 📋 Task (T)
+“My core objective was to redesign this data engineering pipeline to make it secure, scalable, and fully resilient. I was charged with:
+1. Creating a highly reliable ingestion framework capable of handling complex schema mapping shifts (preventing schema drift between dynamic partner data specs).
+2. Automating deduplication on high-cardinality elements like `ProductName` and unique `dosageFormId` elements.
+3. Reducing processing runtimes, which frequently spiked during heavy nested schema transformations.”
+
+#### 🛠️ Action (A)
+“To resolve these challenges on Azure Databricks and Azure Data Factory, I executed five major structural optimizations:
+
+1. **Defined strict, explicit structures with explicit schemas**: 
+   Rather than relying on Spark's costly automatic schema inference—which regularly scanned files repeatedly and guessed formats wrongly when fields were missing or arrays was empty—I implemented a static, production-ready hierarchical **`StructType` schema**. This structured layout validated root objects down to individual nested values on ingestion run-time, intercepting downstream failures instantly.
+   
+2. **Designed Delta Lake Upsert Patterns**: 
+   Legacy iterations re-wrote the entire catalog daily, causing massive write overhead. I migrated the target tables to **Delta Lake format** and implemented explicit `MERGE INTO` upsert actions. By defining robust target criteria on `dosageFormId` and `GenericDrugId`, we isolated changed products and executed fast, atomic updates without disrupting ongoing queries.
+
+3. **Partitioned Data Strategically**: 
+   Partitioning by high-cardinality fields like drug attributes creates thousands of tiny physical directories, causing severe performance degradation (the *'small file problem'*). To fix this, I partitioned our Delta structures by `ingestion_date` and `country_code` (e.g. separating `jp` & `in` processing). This allowed Spark's query planner to perform partition pruning, parsing only target records and eliminating billions of unused directory checks.
+
+4. **Isolated Malformed Data with Resilient Schemas**:
+   To prevent dirty file structures (such as incorrect standard encoding sets or truncated arrays) from breaking the entire production pipeline, I configured a `badRecordsPath` directory. Additionally, I utilized Spark's `PERMISSIVE` mode with a designated `_corrupt_record` column. When bad rows were encountered, they were quarantined cleanly for clinical audit teams while allowing valid products to continue downstream.
+
+5. **Implemented Broadcast Joins & Applied Early Filters**:
+   Mapping our records to master clinical ontologies (such as mapping rules and dynamic triage validations) originally caused massive shuffle overloads when joining large catalogs. Because our master reference predicate lookup dataset was relatively small (a few megabytes), I used Spark's **`broadcast()` joins** to distribute the mapping table to all executors. I combined this with early filtering rules, dropping unmatched or invalid products before running shuffles, which significantly reduced cluster network traffic.”
+
+#### 🏆 Result (R)
+* **Runtime Slashed**: The total end-to-end execution time was cut down by **55%**, reducing a 4-hour process to less than 2 hours.
+* **Reliability to 100%**: System crashes due to OOMs or data discrepancies were entirely eliminated.
+* **Guaranteed Data Quality**: Data discrepancies (such as duplicate products or incomplete interaction listings) were instantly isolated, providing business analytics teams clean, audited datasets for downstream reporting dashboards on Day 1.
+
+---
+
+## 6. Technical Interview Q&A
+
+Prepare for follow-up questions with these expert answers tailored to Azure Data Factory & Databricks.
+
+### Q1: How do you coordinate dynamic client CSV feeds into Azure Storage incrementally?
+* **Answer**: 
+  We leverage **Azure Data Factory (ADF)** integrated with **Azure Event Grid Triggers** to build a real-time, metadata-driven ingestion framework.
+  * **Event-Driven & Metadata Architecture**: When the client uploads weekly CSV files into ADLS Gen2, ADF dynamically references a control table to grab high-watermark CDC timestamps. It parameterizes the ingestion to exclusively process new or modified datasets, converting them to optimized Parquet format in the Bronze layer.
+  * **Idempotence & Empty File Handling**: To ensure reruns are fully idempotent and avoid processing blank files, we built dynamic conditional purge mechanisms using IF Conditions and Delete activities to clean up empty feeds automatically.
+
+---
+
+### Q2: Spark's `explode()` function can drastically inflate the dataset size. How do you handle the performance impact?
+* **Answer**:
+  Exploding highly nested files (e.g. drug details containing long nested list records of brands and products) multiplies the row count, increasing memory pressure. To mitigate this:
+  1. I apply **Early Filtering**: I filter out invalid drugs or unreferenced countries *before* performing the explode operations.
+  2. I explode only the required nested attributes instead of the entire parent payload.
+  3. If the data size is large, I write intermediate exploded tables to Delta files in ADLS Gen2 as checkpoint barriers. This lets Spark clear its execution DAG and limits memory consumption.
+
+---
+
+### Q3: How did you handle dynamic JSON schemas or schema drift in your Databricks logs/feeds?
+* **Answer**: 
+  In an Azure Databricks architecture, I leverage **Delta Lake Schema Evolution** and the **Schema Enforcement** pattern:
+  * By default, if incoming columns don't match the exact target Delta lake schema, Delta Lake blocks the write to ensure data integrity.
+  * When partner schema updates occur (such as custom variables requested by MedicalNote Inc), I enable the `mergeSchema` configuration option (`.option("mergeSchema", "true")`) during our Spark write sequence to safely append new ontologies or properties:
+    ```python
+    df.write.format("delta") \
+      .mode("append") \
+      .option("mergeSchema", "true") \
+      .save("/mnt/silver/drugs_catalog")
+    ```
+
+---
+
+### Q4: What are the primary causes of Spark OOM (Out of Memory) in Databricks, and how did you debug them?
+* **Answer**:
+  OOM failures in Databricks commonly stem from:
+  1. **Data Skew**: A single partition holding disproportionately large records (e.g. an active drug class with far more records than others), causing one executor to crash while others sit idle.
+  2. **Over-Allocation from Broadcast Joins**: Designing broadcast joins without memory limits, which loads large tables into executor memory and causes `OutOfMemoryError: Java heap space`.
+  3. **Small File overhead / excessive fragmentation**.
+  
+  * **Mitigation**:
+    * Analyzed the Spark UI to check task processing timelines and trace skewed partition runtimes.
+    * Enabled **Adaptive Query Execution (AQE)** in Spark (`spark.sql.adaptive.enabled=true`) to dynamically coalesce tiny partitions, optimize shuffles, and resolve data skew at runtime.
+    * Used salted keys (`F.concat(col("key"), F.lit("_"), F.round(F.rand() * N))`) to distribute highly concentrated datasets evenly across nodes, eliminating shuffle bottlenecks.
+
+---
+
+## 7. 4-Minute Elevator Pitch (Project Presentation Script)
+
+*Read or adapt this script during your technical presentation to concisely explain your architecture, engineering complexity, and business impact in under 4 minutes.*
+
+### ⏱️ Minute 1: Hook & Architecture Ingestion (0:00 – 1:00)
+> "Hello everyone. I'd like to present my recent project where I led the modernization of a large-scale pharmaceutical drug metadata pipeline. Our goal was to ingest dynamic clinical feeds and structured specs from global providers into a unified catalog for robust downstream reporting. For ingestion, we built a highly scalable, metadata-driven framework using **Azure Data Factory (ADF)** and **Azure SQL Server**. The client directly uploads weekly CSV files into ADLS Gen2. Our event-driven ingestion, triggered via **Azure Event Grid**, fully parameterized control flows with watermarks and CDC to extract only incoming active records, dynamically purging any empty files to guarantee idempotency across runs."
+
+### ⏱️ Minute 2: Medallion Architecture & Transformations (1:00 – 2:00)
+> "Once raw data lands, we trigger **Azure Databricks** multi-node clusters to execute the transformation using the Medallion pattern. In our Silver layer, we handle heavily nested hierarchical structures. Using PySpark’s `explode()` function, we flatten the deep arrays containing GenericDrug, Brand, and Product objects into standard relational formats. Additionally, we sanitize different character encoding formats and run rigorous data quality validations—such as automatically isolating records missing mandatory safety attributes like drug-alcohol interactions."
+
+### ⏱️ Minute 3: Advanced Spark Engineering (2:00 – 3:00)
+> "At scale, performance and reliability were our major challenges. We resolved Out-of-Memory errors and small-file bottlenecks by enforcing explicit `StructType` schemas—intercepting malformed schema mutations early—and partitioning our target Delta Lake tables by ingestion date and country code. To map incoming drugs against active reference schemas, we utilized Spark’s `broadcast()` joins to share small ontology datasets across our worker nodes, avoiding expensive network shuffles entirely. Meanwhile, corrupt inputs were intercepted using a dynamic `badRecordsPath`, ensuring pipeline continuity without breaking daily SLA targets."
+
+### ⏱️ Minute 4: Impact & Closing (3:00 – 4:00)
+> "Finally, in the Gold layer, we used Spark Window functions to prevent product duplication, resolving potential reconciliation issues before the clinical data reaches our consumers. As a result, the total pipeline execution time shrunk by 55%, system crashes were completely eliminated, and we successfully delivered 100% reliable, high-speed data for our clinical analytics and PowerBI reporting teams. Thank you, and I’m happy to take any questions."
+
+
+
+
+CommonName,GenericDrugId,OtherGenericNames,BrandName,ProductName,DrugRoute,DrugDosage,DrugForm,DrugMedicationGuidelines,DrugAvailability,Indications,Contraindications,DrugTherapeuticClass,DrugDescription,DrugDrugInteractions,DrugFoodInteractions,DrugAlcoholInteractions,DrugTobaccoInteractions,PregnancyWarnings,LactationWarnings,DrivingWarnings,KidneyWarnings,LiverWarnings,RecalledDrugUpdates,Allergies,Images,SideEffectFrequency,SideEffectWhenToSeeADoctor,SideEffectDescription
+Ibuprofen,RX-1001,Isobutylphenylpropionic acid,"Advil, Motrin",Ibuprofen 200mg Tablet,Oral,200-400 mg every 4 to 6 hours as needed.,Tablet,Take with food or milk to prevent stomach upset.,Over-the-counter (OTC),"Pain relief, Fever reduction, Inflammation","Active gastrointestinal bleeding, History of asthma triggered by NSAIDs.",Nonsteroidal Anti-inflammatory Drug (NSAID),"Used to relieve pain from various conditions such as headache, dental pain, menstrual cramps, muscle aches, or arthritis.","Aspirin, Blood thinners (Warfarin), Corticosteroids.",None,Avoid alcohol as it increases the risk of stomach bleeding.,None,Avoid use during the third trimester of pregnancy.,"Considered generally safe, but consult a doctor.",May cause dizziness in rare cases. Use caution.,Use with caution in patients with renal impairment.,Use with caution in patients with hepatic impairment.,None,Do not use if allergic to NSAIDs.,"https://dummyimage.com/ibuprofen_front.jpg, https://dummyimage.com/ibuprofen_back.jpg",Frequent,No,"Nausea, Vomiting, Stomach pain, Heartburn"
+Amoxicillin,RX-1002,Amoxycillin,"Amoxil, Moxatag",Amoxicillin 500mg Capsule,Oral,500 mg every 8 hours or 875 mg every 12 hours.,Capsule,Finish the entire prescribed course even if symptoms disappear.,Prescription,"Bacterial infections, Ear infections, Strep throat",Hypersensitivity to penicillins.,Penicillin Antibiotic,A penicillin antibiotic that fights bacteria in the body.,"Methotrexate, Probenecid, Oral contraceptives (may reduce effectiveness).",Can be taken with or without food.,"No specific contraindication, but best to avoid while recovering from infection.",None,Considered generally safe (Category B).,"Excreted in human milk, but generally considered safe.",None,Dose adjustment required in severe renal impairment.,Rare instances of hepatic dysfunction reported.,None,Penicillin allergy.,https://dummyimage.com/amoxicillin.jpg,Frequent,Yes,"Diarrhea, Skin rash, Allergic reactions"
+Atorvastatin,RX-1003,None,Lipitor,Atorvastatin 20mg Film-coated Tablet,Oral,10-20 mg once daily.,Film-coated Tablet,Take at the same time each day. Follow a cholesterol-lowering diet.,Prescription,"Hyperlipidemia, Prevention of cardiovascular disease","Active liver disease, Unexplained persistent elevations of hepatic transaminases.",Statin (HMG-CoA Reductase Inhibitor),"Used along with a proper diet to help lower bad cholesterol and fats (such as LDL, triglycerides) and raise good cholesterol (HDL).","Cyclosporine, HIV protease inhibitors, Certain macrolide antibiotics.",Avoid eating grapefruit or drinking grapefruit juice.,Avoid excessive alcohol consumption; increases risk of liver damage.,None,Contraindicated in pregnancy (Category X).,Contraindicated during breastfeeding.,None,No dosage adjustment needed.,Contraindicated in active liver disease.,None,Statin allergy.,https://dummyimage.com/atorvastatin.jpg,Rare,Yes,"Unexplained muscle pain, Tenderness, Weakness (Risk of Rhabdomyolysis)"
+Metformin,RX-1004,None,Glucophage,Metformin 500mg Extended Release Tablet,Oral,500 mg once daily with the evening meal.,Extended Release Tablet,"Swallow whole; do not crush, chew, or break.",Prescription,Type 2 Diabetes Mellitus,"Severe renal impairment, Metabolic acidosis.",Biguanide,Helps control high blood sugar in people with type 2 diabetes.,"Iodinated contrast imaging agents, Topiramate.",Take with food to minimize GI upset.,Avoid excessive alcohol; increases risk of lactic acidosis.,None,"Generally safe, but insulin is often preferred during pregnancy.","Safe, but monitor the infant for hypoglycemia.",Risk of hypoglycemia if combined with other diabetic medications.,Contraindicated in severe renal impairment (eGFR < 30).,Avoid use in patients with clinical or laboratory evidence of hepatic disease.,"Some extended-release lots recalled in 2020 due to NDMA levels.",Biguanide allergy.,https://dummyimage.com/metformin.jpg,Frequent,No,"Diarrhea, Nausea, Upset stomach, Metallic taste in mouth"
+Lisinopril,RX-1005,None,"Prinivil, Zestril",Lisinopril 10mg Tablet,Oral,10 mg once daily.,Tablet,Drink plenty of water to prevent dehydration.,Prescription,"Hypertension, Heart failure, Acute myocardial infarction",History of angioedema related to previous ACE inhibitor treatment.,ACE Inhibitor,An ACE inhibitor used to treat high blood pressure and heart failure.,"Potassium supplements, Diuretics, NSAIDs.",Avoid salt substitutes containing potassium.,Alcohol can lower blood pressure further and increase side effects like dizziness.,None,Contraindicated (can cause fetal injury or death).,Not recommended during breastfeeding.,"May cause dizziness or lightheadedness, especially when standing up quickly.",May cause renal impairment; monitor kidney function.,Rare cases of hepatic failure reported.,None,ACE inhibitor allergy.,https://dummyimage.com/lisinopril.jpg,Frequent,Yes,"Dry cough, Dizziness, Headache, High potassium levels"
+
